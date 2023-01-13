@@ -35,6 +35,8 @@ import org.snmp4j.util.ThreadPool;
 
 public class SNMPReceiver implements CommandResponder {
 
+	
+	
 	private static final Logger logger = Logger.getLogger(SNMPReceiver.class.getName());
 	private MultiThreadedMessageDispatcher dispatcher;
 	private static Producer<String, String> producer = null;
