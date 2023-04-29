@@ -30,14 +30,20 @@ import org.snmp4j.MessageDispatcherImpl;
 import org.snmp4j.PDU;
 import org.snmp4j.PDUv1;
 import org.snmp4j.Snmp;
+import org.snmp4j.Target;
 import org.snmp4j.TransportMapping;
+import org.snmp4j.UserTarget;
 import org.snmp4j.mp.MPv1;
 import org.snmp4j.mp.MPv2c;
 import org.snmp4j.mp.MPv3;
 import org.snmp4j.mp.SnmpConstants;
+import org.snmp4j.security.AuthMD5;
+import org.snmp4j.security.PrivDES;
+import org.snmp4j.security.SecurityLevel;
 import org.snmp4j.security.SecurityModels;
 import org.snmp4j.security.SecurityProtocols;
 import org.snmp4j.security.USM;
+import org.snmp4j.security.UsmUser;
 import org.snmp4j.smi.Address;
 import org.snmp4j.smi.GenericAddress;
 import org.snmp4j.smi.IpAddress;
@@ -52,9 +58,9 @@ import org.snmp4j.transport.DefaultUdpTransportMapping;
 import org.snmp4j.util.MultiThreadedMessageDispatcher;
 import org.snmp4j.util.ThreadPool;
 
-public class SNMPReceiver implements CommandResponder {
+public class SNMPV3Receiver implements CommandResponder {
 
-	private static final Logger logger = Logger.getLogger(SNMPReceiver.class.getName());
+	private static final Logger logger = Logger.getLogger(SNMPV3Receiver.class.getName());
 	private MultiThreadedMessageDispatcher dispatcher;
 	private static KafkaProducer<String, String> producer = null;
 	private Snmp snmp = null;
@@ -64,7 +70,7 @@ public class SNMPReceiver implements CommandResponder {
 	static BufferedWriter writer = null;
 	static Properties appProperties = null;
 
-	public SNMPReceiver() {
+	public SNMPV3Receiver() {
 
 	}
 
@@ -76,7 +82,7 @@ public class SNMPReceiver implements CommandResponder {
 			initLog4J(); // Initializes log4J logger library.
 			initKafka(); // Initializes Kafka
 
-			new SNMPReceiver().run();
+			new SNMPV3Receiver().run();
 
 			logger.info("Trap receiving program started");
 		} catch (Exception ex) {
@@ -129,10 +135,12 @@ public class SNMPReceiver implements CommandResponder {
 
 			USM usm = new USM(SecurityProtocols.getInstance(), new OctetString(MPv3.createLocalEngineID()), 0);
 			SecurityModels.getInstance().addSecurityModel(usm);
+			snmp.getUSM().addUser(new OctetString("USERNAME"), 
+					new UsmUser(new OctetString("USERNAME"), AuthMD5.ID,
+					new OctetString("PASSWORD"), PrivDES.ID, new OctetString("PASSWORD")));
 
 			snmp = new Snmp(dispatcher, transport);
-			snmp.getMessageDispatcher().addMessageProcessingModel(new MPv1());
-			snmp.getMessageDispatcher().addMessageProcessingModel(new MPv2c());
+			snmp.getMessageDispatcher().addMessageProcessingModel(new MPv3());
 			snmp.listen();
 			logger.info("waiting for traps......");
 
@@ -189,34 +197,9 @@ public class SNMPReceiver implements CommandResponder {
 			System.out.println("Writing to Kafka");
 			PushMessageToKafka("rawalarms", trapCounter + "", trapObj.toJSONString());
 			System.out.println("Written to Kafka");
-//			writer.append(event.toString());
-//			writer.newLine();
-//			writer.flush();
 
-			if (pduType == PDU.V1TRAP) {
-				logger.info("V1 trap received");
-				PDUv1 pdv1 = (PDUv1) event.getPDU();
-
-				OID enterprizeOID = pdv1.getEnterprise();
-				int genTrap = pdv1.getGenericTrap();
-				int specTrap = pdv1.getSpecificTrap();
-				IpAddress agentAdd = pdv1.getAgentAddress();
-
-				v1Trap.put("enterprise_oid", enterprizeOID.toString());
-				v1Trap.put("generic_trap", genTrap + "");
-				v1Trap.put("specific_trap", specTrap + "");
-				v1Trap.put("agent_address", agentAdd.toString());
-				
-				enableIPTables(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"));
-				this.forwardV1TrapToDestintion(appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"), bindings, v1Trap);
-				disableIPTables(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"));
-			} else {
-				this.sendToSevOne(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"), bindings);
-			}
+			this.sendToSevOne(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
+					appProperties.getProperty("TRAP_DESTINATION_PORT"), bindings);
 
 		} catch (Exception ex) {
 			ex.printStackTrace();
@@ -307,71 +290,34 @@ public class SNMPReceiver implements CommandResponder {
 			VariableBinding[] bindings) {
 		if (sourceIp.equals(destinationIP)) {
 			logger.info("Source and Destination is same. no spoofing");
-			ForwardTrap2SevOne(destinationIP, destinationPort, bindings, sourceIp);
+			ForwardTrap2SevOne(destinationIP, destinationPort, bindings);
 		} else {
 			enableIPTables(sourceIp, destinationIP, destinationPort);
-			ForwardTrap2SevOne(destinationIP, destinationPort, bindings, sourceIp);
+			ForwardTrap2SevOne(destinationIP, destinationPort, bindings);
 			disableIPTables(sourceIp, destinationIP, destinationPort);
 		}
 
 	}
 
-	public void sendSnmpV1Trap(String destinationIP, String destinationPort, String trapOID, int specificTrap,
-			VariableBinding[] trapBindingsList) {
-		try {
-			// Create Transport Mapping
-			String community = "public";
-			TransportMapping transport = new DefaultUdpTransportMapping();
-			transport.listen();
-
-			// Create Target
-			CommunityTarget comtarget = new CommunityTarget();
-			comtarget.setCommunity(new OctetString(community));
-			comtarget.setVersion(SnmpConstants.version1);
-			comtarget.setAddress(new UdpAddress(destinationIP + "/" + destinationPort));
-			comtarget.setRetries(4);
-			comtarget.setTimeout(10000);
-
-			// Create PDU for V1
-			PDUv1 pdu = new PDUv1();
-			pdu.setType(PDU.V1TRAP);
-			pdu.setEnterprise(new OID(trapOID));
-			pdu.setGenericTrap(PDUv1.ENTERPRISE_SPECIFIC); // 6
-			pdu.setSpecificTrap(specificTrap);
-			pdu.setAgentAddress(new UdpAddress(destinationIP + "/" + destinationPort));
-
-			pdu.addAll(trapBindingsList);
-
-			// Send the PDU
-			Snmp snmp = new Snmp(transport);
-
-			snmp.send(pdu, comtarget);
-			snmp.close();
-			System.out.println("Trap send successfully!!");
-		} catch (Exception e) {
-
-			System.err.println("Exception Message = " + e.getMessage());
-		}
-	}
-
 	public void ForwardTrap2SevOne(String destinationIPVal, String destinationPortVal,
-			VariableBinding[] trapBindingsList, String sourceDeviceIp) {
+			VariableBinding[] trapBindingsList) {
 
 		try {
 
 			// Create Transport Mapping
 			TransportMapping transport = new DefaultUdpTransportMapping();
 			transport.listen();
-			String community = "public";
-
-			// Create Target for V2 trap
-			CommunityTarget cTarget = new CommunityTarget();
-			cTarget.setCommunity(new OctetString(community));
-			cTarget.setVersion(SnmpConstants.version2c);
-			cTarget.setAddress(new UdpAddress(destinationIPVal + "/" + destinationPortVal));
-			cTarget.setRetries(3);
-			cTarget.setTimeout(5000);
-
+			
+			 // Create the target for forwarding the traps
+	        UserTarget target = new UserTarget();
+	        target.setVersion(SnmpConstants.version3);
+	        target.setSecurityLevel(SecurityLevel.AUTH_PRIV);
+	        target.setAddress(new UdpAddress(destinationIPVal + "/" + destinationPortVal));
+	        target.setSecurityName(new OctetString("USERNAME"));
+	        target.setRetries(3);
+			target.setTimeout(5000);
+			
+			
 			// Create PDU for V2
 			PDU pdu = new PDU();
 
@@ -385,7 +331,7 @@ public class SNMPReceiver implements CommandResponder {
 			// Send the PDU
 			pdu.setType(PDU.TRAP);
 			Snmp snmp = new Snmp(transport);
-			snmp.send(pdu, cTarget);
+			snmp.send(pdu, target);
 			snmp.close();
 
 		} catch (Exception ex) {
@@ -444,62 +390,6 @@ public class SNMPReceiver implements CommandResponder {
 		try {
 			p = Runtime.getRuntime().exec(new String[] { "/bin/sh", "-c", command });
 			p.waitFor();
-		} catch (Exception ex) {
-			StringWriter sw = new StringWriter();
-			PrintWriter pw = new PrintWriter(sw);
-			ex.printStackTrace(pw);
-
-			String errorString = sw.toString();
-			logger.info(errorString);
-		}
-
-	}
-
-	/**
-	 * This methods sends the V1 trap to the destination.
-	 */
-	public void forwardV1TrapToDestintion(String destinationIPVal, String destinationPortVal,
-			VariableBinding[] trapBindingsList, HashMap<String, String> v1TrapDetails) {
-
-		try {
-
-			// Create Transport Mapping
-			TransportMapping transport = new DefaultUdpTransportMapping();
-			transport.listen();
-			String community = "public";
-
-			// Create Target for V2 trap
-			CommunityTarget cTarget = new CommunityTarget();
-			cTarget.setCommunity(new OctetString(community));
-			cTarget.setVersion(SnmpConstants.version1);
-			cTarget.setAddress(new UdpAddress(destinationIPVal + "/" + destinationPortVal));
-			cTarget.setRetries(3);
-			cTarget.setTimeout(5000);
-
-			// Create PDU for V2
-			PDUv1 pdu = new PDUv1();
-
-			// Add all bindings which was received from trap.
-			pdu.addAll(trapBindingsList);
-
-			// Send the PDU
-			pdu.setType(PDU.V1TRAP);
-			String enterpriseOID = v1TrapDetails.get("enterprise_oid");
-			int genricTrap = Integer.parseInt(v1TrapDetails.get("generic_trap"));
-			int specificTrap = Integer.parseInt(v1TrapDetails.get("specific_trap"));
-			String agentAddress = v1TrapDetails.get("agent_address");
-
-			pdu.setEnterprise(new OID(enterpriseOID));
-			pdu.setGenericTrap(genricTrap);
-			pdu.setSpecificTrap(specificTrap);
-			pdu.setAgentAddress(new IpAddress(agentAddress));
-
-			logger.info("========Sending V1 trap to with PDU=======================" + pdu.toString());
-
-			Snmp snmp = new Snmp(transport);
-			snmp.send(pdu, cTarget);
-			snmp.close();
-
 		} catch (Exception ex) {
 			StringWriter sw = new StringWriter();
 			PrintWriter pw = new PrintWriter(sw);

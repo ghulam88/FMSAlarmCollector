@@ -52,9 +52,9 @@ import org.snmp4j.transport.DefaultUdpTransportMapping;
 import org.snmp4j.util.MultiThreadedMessageDispatcher;
 import org.snmp4j.util.ThreadPool;
 
-public class SNMPReceiver implements CommandResponder {
+public class SNMPV1Receiver implements CommandResponder {
 
-	private static final Logger logger = Logger.getLogger(SNMPReceiver.class.getName());
+	private static final Logger logger = Logger.getLogger(SNMPV1Receiver.class.getName());
 	private MultiThreadedMessageDispatcher dispatcher;
 	private static KafkaProducer<String, String> producer = null;
 	private Snmp snmp = null;
@@ -64,7 +64,7 @@ public class SNMPReceiver implements CommandResponder {
 	static BufferedWriter writer = null;
 	static Properties appProperties = null;
 
-	public SNMPReceiver() {
+	public SNMPV1Receiver() {
 
 	}
 
@@ -76,7 +76,7 @@ public class SNMPReceiver implements CommandResponder {
 			initLog4J(); // Initializes log4J logger library.
 			initKafka(); // Initializes Kafka
 
-			new SNMPReceiver().run();
+			new SNMPV1Receiver().run();
 
 			logger.info("Trap receiving program started");
 		} catch (Exception ex) {
@@ -132,7 +132,6 @@ public class SNMPReceiver implements CommandResponder {
 
 			snmp = new Snmp(dispatcher, transport);
 			snmp.getMessageDispatcher().addMessageProcessingModel(new MPv1());
-			snmp.getMessageDispatcher().addMessageProcessingModel(new MPv2c());
 			snmp.listen();
 			logger.info("waiting for traps......");
 
@@ -163,6 +162,10 @@ public class SNMPReceiver implements CommandResponder {
 			String peerAddrArr[] = peerAddr.split("/");
 			PDU pdu = event.getPDU();
 			int pduType = pdu.getType();
+			if (pduType != PDU.V1TRAP) {
+				logger.info("Received trap is NOT a V1 Trap skipping it");
+				return;
+			}
 			HashMap<String, String> v1Trap = new HashMap<>();
 			String sourceDeviceIp = peerAddrArr[0];
 
@@ -189,34 +192,26 @@ public class SNMPReceiver implements CommandResponder {
 			System.out.println("Writing to Kafka");
 			PushMessageToKafka("rawalarms", trapCounter + "", trapObj.toJSONString());
 			System.out.println("Written to Kafka");
-//			writer.append(event.toString());
-//			writer.newLine();
-//			writer.flush();
 
-			if (pduType == PDU.V1TRAP) {
-				logger.info("V1 trap received");
-				PDUv1 pdv1 = (PDUv1) event.getPDU();
+			logger.info("V1 trap received");
+			PDUv1 pdv1 = (PDUv1) event.getPDU();
 
-				OID enterprizeOID = pdv1.getEnterprise();
-				int genTrap = pdv1.getGenericTrap();
-				int specTrap = pdv1.getSpecificTrap();
-				IpAddress agentAdd = pdv1.getAgentAddress();
+			OID enterprizeOID = pdv1.getEnterprise();
+			int genTrap = pdv1.getGenericTrap();
+			int specTrap = pdv1.getSpecificTrap();
+			IpAddress agentAdd = pdv1.getAgentAddress();
 
-				v1Trap.put("enterprise_oid", enterprizeOID.toString());
-				v1Trap.put("generic_trap", genTrap + "");
-				v1Trap.put("specific_trap", specTrap + "");
-				v1Trap.put("agent_address", agentAdd.toString());
-				
-				enableIPTables(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"));
-				this.forwardV1TrapToDestintion(appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"), bindings, v1Trap);
-				disableIPTables(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"));
-			} else {
-				this.sendToSevOne(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
-						appProperties.getProperty("TRAP_DESTINATION_PORT"), bindings);
-			}
+			v1Trap.put("enterprise_oid", enterprizeOID.toString());
+			v1Trap.put("generic_trap", genTrap + "");
+			v1Trap.put("specific_trap", specTrap + "");
+			v1Trap.put("agent_address", agentAdd.toString());
+
+			enableIPTables(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
+					appProperties.getProperty("TRAP_DESTINATION_PORT"));
+			this.forwardV1TrapToDestintion(appProperties.getProperty("TRAP_DESTINATION_IP"),
+					appProperties.getProperty("TRAP_DESTINATION_PORT"), bindings, v1Trap);
+			disableIPTables(sourceDeviceIp, appProperties.getProperty("TRAP_DESTINATION_IP"),
+					appProperties.getProperty("TRAP_DESTINATION_PORT"));
 
 		} catch (Exception ex) {
 			ex.printStackTrace();
@@ -303,18 +298,7 @@ public class SNMPReceiver implements CommandResponder {
 		}
 	}
 
-	private void sendToSevOne(String sourceIp, String destinationIP, String destinationPort,
-			VariableBinding[] bindings) {
-		if (sourceIp.equals(destinationIP)) {
-			logger.info("Source and Destination is same. no spoofing");
-			ForwardTrap2SevOne(destinationIP, destinationPort, bindings, sourceIp);
-		} else {
-			enableIPTables(sourceIp, destinationIP, destinationPort);
-			ForwardTrap2SevOne(destinationIP, destinationPort, bindings, sourceIp);
-			disableIPTables(sourceIp, destinationIP, destinationPort);
-		}
 
-	}
 
 	public void sendSnmpV1Trap(String destinationIP, String destinationPort, String trapOID, int specificTrap,
 			VariableBinding[] trapBindingsList) {
@@ -354,51 +338,7 @@ public class SNMPReceiver implements CommandResponder {
 		}
 	}
 
-	public void ForwardTrap2SevOne(String destinationIPVal, String destinationPortVal,
-			VariableBinding[] trapBindingsList, String sourceDeviceIp) {
-
-		try {
-
-			// Create Transport Mapping
-			TransportMapping transport = new DefaultUdpTransportMapping();
-			transport.listen();
-			String community = "public";
-
-			// Create Target for V2 trap
-			CommunityTarget cTarget = new CommunityTarget();
-			cTarget.setCommunity(new OctetString(community));
-			cTarget.setVersion(SnmpConstants.version2c);
-			cTarget.setAddress(new UdpAddress(destinationIPVal + "/" + destinationPortVal));
-			cTarget.setRetries(3);
-			cTarget.setTimeout(5000);
-
-			// Create PDU for V2
-			PDU pdu = new PDU();
-
-			// Add all bindings which was received from trap.
-			pdu.addAll(trapBindingsList);
-			// sevOneForwardCount++;
-			logger.info("========Sending trap to IP : " + destinationIPVal + " Port : " + destinationPortVal);
-			// logger.info("SevOne trap count=" + sevOneForwardCount);
-			logger.info("========Sending trap with PDU=======================" + pdu.toString());
-
-			// Send the PDU
-			pdu.setType(PDU.TRAP);
-			Snmp snmp = new Snmp(transport);
-			snmp.send(pdu, cTarget);
-			snmp.close();
-
-		} catch (Exception ex) {
-			StringWriter sw = new StringWriter();
-			PrintWriter pw = new PrintWriter(sw);
-			ex.printStackTrace(pw);
-
-			String errorString = sw.toString();
-			logger.info(errorString);
-		}
-
-	}
-
+	
 	private void enableIPTables(String sourceIP, String destinationIP, String destinationPort) {
 
 		// iptables -t nat -A POSTROUTING -d $TRAP_RECEIVER -p udp --dport 162
